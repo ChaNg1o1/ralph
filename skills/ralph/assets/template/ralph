@@ -1,0 +1,32 @@
+#!/bin/bash
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_ENGINE="$SCRIPT_DIR/ralph.sh"
+PROJECT_ENGINE="$SCRIPT_DIR/scripts/ralph/ralph.sh"
+PWD_ENGINE="$PWD/scripts/ralph/ralph.sh"
+COMMAND="${1:-}"
+
+if [ -f "$PWD_ENGINE" ]; then
+  exec "$PWD_ENGINE" "$@"
+fi
+
+if [ "$COMMAND" = "init" ] && [ -f "$LOCAL_ENGINE" ]; then
+  exec "$LOCAL_ENGINE" "$@"
+fi
+
+if [ -f "$PROJECT_ENGINE" ]; then
+  exec "$PROJECT_ENGINE" "$@"
+fi
+
+if [ -f "$LOCAL_ENGINE" ] && [ "$SCRIPT_DIR" = "$PWD" ]; then
+  exec "$LOCAL_ENGINE" "$@"
+fi
+
+echo "Error: Could not find Ralph engine."
+echo "Expected either:"
+echo "  $LOCAL_ENGINE"
+echo "  $PROJECT_ENGINE"
+echo "  $PWD_ENGINE"
+exit 1
