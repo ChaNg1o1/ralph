@@ -47,6 +47,8 @@ This creates:
 - `scripts/ralph/prd.json`
 - `scripts/ralph/progress.txt`
 
+The generated `scripts/ralph/prd.json` is starter example data. Replace it with your real stories, or generate a fresh one from your PRD, before running `go`.
+
 Use `--force` to overwrite existing scaffolded files:
 
 ```bash
@@ -165,7 +167,7 @@ $ralph resume
 
 ### 3. Review, Then Run Ralph
 
-After `init`, review `scripts/ralph/prd.json` first. Once it looks right, start the loop:
+After `init`, review `scripts/ralph/prd.json` first. It is scaffolded from example data, so replace or regenerate it for your actual project before you start the loop. Once it looks right, run:
 
 ```bash
 # Show current state
