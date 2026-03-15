@@ -2,8 +2,8 @@
 # Ralph Wiggum - Long-running AI agent loop
 # Usage:
 #   ./ralph.sh init [target_project_dir] [--force]
-#   ./ralph.sh go [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N]
-#   ./ralph.sh resume [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N]
+#   ./ralph.sh go [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N] [--idle-timeout N]
+#   ./ralph.sh resume [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N] [--idle-timeout N]
 #   ./ralph.sh status
 
 set -e
@@ -15,13 +15,18 @@ ARCHIVE_DIR="$SCRIPT_DIR/archive"
 LAST_BRANCH_FILE="$SCRIPT_DIR/.last-branch"
 STATE_FILE="$SCRIPT_DIR/.ralph-state.json"
 PROJECT_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd) || pwd)"
+RUN_ACTIVE=false
+CURRENT_STORY_ID=""
+CURRENT_STAGNANT_COUNT=0
+CURRENT_REASON=""
+CURRENT_ITERATIONS_RUN=0
 
 print_usage() {
   cat <<'EOF'
 Usage:
   ./ralph.sh init [target_project_dir] [--force]
-  ./ralph.sh go [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N]
-  ./ralph.sh resume [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N]
+  ./ralph.sh go [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N] [--idle-timeout N]
+  ./ralph.sh resume [--tool codex|amp|claude] [--max-iterations N] [--stagnant-limit N] [--idle-timeout N]
   ./ralph.sh status
 
 Commands:
@@ -34,6 +39,7 @@ Options:
   --tool <name>        Tool to use for Ralph iterations: codex, amp, claude
   --max-iterations <n> Maximum iterations for a go/resume run
   --stagnant-limit <n> Exit as BLOCKED after N iterations without story progress
+  --idle-timeout <n>   Stop the active tool after N seconds without stdout/stderr output (0 disables)
   --force              Overwrite scaffolded files during init
   --help               Show this help
 
@@ -63,6 +69,24 @@ copy_template_file() {
   fi
 
   cp "$source_path" "$target_path"
+  echo "Wrote: $target_path"
+}
+
+write_runtime_gitignore() {
+  local target_path="$1"
+
+  mkdir -p "$(dirname "$target_path")"
+
+  if [ -e "$target_path" ] && [ "$FORCE_INIT" = false ]; then
+    echo "Skip existing: $target_path"
+    return
+  fi
+
+  cat > "$target_path" <<'EOF'
+.last-branch
+.ralph-state.json
+EOF
+
   echo "Wrote: $target_path"
 }
 
@@ -137,6 +161,70 @@ write_state_file() {
       updatedAt: $updatedAt
     }' > "$target_path"
 }
+
+set_current_run_context() {
+  CURRENT_STORY_ID="${1:-}"
+  CURRENT_STAGNANT_COUNT="${2:-0}"
+  CURRENT_REASON="${3:-}"
+  CURRENT_ITERATIONS_RUN="${4:-0}"
+}
+
+persist_current_run_state() {
+  local status="$1"
+  write_state_file "$status" "$CURRENT_STORY_ID" "$CURRENT_STAGNANT_COUNT" "$CURRENT_REASON" "$CURRENT_ITERATIONS_RUN"
+}
+
+clear_current_run_context() {
+  RUN_ACTIVE=false
+  set_current_run_context "" 0 "" 0
+}
+
+terminate_active_children() {
+  pkill -TERM -P $$ 2>/dev/null || true
+  sleep 1
+  pkill -KILL -P $$ 2>/dev/null || true
+}
+
+finish_run() {
+  local status="$1"
+  local exit_code="$2"
+  persist_current_run_state "$status"
+  clear_current_run_context
+  exit "$exit_code"
+}
+
+handle_run_signal() {
+  local signal_name="$1"
+  local exit_code="$2"
+  local lowered_signal
+
+  lowered_signal="$(printf '%s' "$signal_name" | tr '[:upper:]' '[:lower:]')"
+
+  if [ "$RUN_ACTIVE" = true ]; then
+    terminate_active_children
+    CURRENT_REASON="signal_${lowered_signal}"
+    persist_current_run_state "interrupted"
+    clear_current_run_context
+  fi
+
+  exit "$exit_code"
+}
+
+handle_run_exit() {
+  local exit_code="$1"
+
+  if [ "$RUN_ACTIVE" = true ] && [ "$exit_code" -ne 0 ]; then
+    if [ -z "$CURRENT_REASON" ]; then
+      CURRENT_REASON="unexpected_exit"
+    fi
+    persist_current_run_state "interrupted"
+    clear_current_run_context
+  fi
+}
+
+trap 'handle_run_signal INT 130' INT
+trap 'handle_run_signal TERM 143' TERM
+trap 'handle_run_exit $?' EXIT
 
 require_prd() {
   if [ ! -f "$PRD_FILE" ]; then
@@ -229,6 +317,7 @@ init_project() {
   copy_template_file "$SCRIPT_DIR/prompt.md" "$target_ralph_dir/prompt.md"
   copy_template_file "$SCRIPT_DIR/CLAUDE.md" "$target_ralph_dir/CLAUDE.md"
   copy_template_file "$SCRIPT_DIR/AGENTS.md" "$target_ralph_dir/AGENTS.md"
+  write_runtime_gitignore "$target_ralph_dir/.gitignore"
 
   if [ ! -f "$target_ralph_dir/prd.json" ] || [ "$FORCE_INIT" = true ]; then
     cp "$SCRIPT_DIR/prd.json.example" "$target_ralph_dir/prd.json"
@@ -319,11 +408,23 @@ validate_tool_choice() {
   fi
 }
 
-run_selected_tool() {
+build_selected_tool_command_json() {
   if [[ "$TOOL" == "amp" ]]; then
-    cat "$SCRIPT_DIR/prompt.md" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr
+    jq -cn '["amp", "--dangerously-allow-all"]'
   elif [[ "$TOOL" == "claude" ]]; then
-    claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee /dev/stderr
+    jq -cn '["claude", "--dangerously-skip-permissions", "--print"]'
+  else
+    jq -cn --arg projectRoot "$PROJECT_ROOT" '["codex", "exec", "-C", $projectRoot, "-s", "danger-full-access"]'
+  fi
+}
+
+write_selected_tool_input() {
+  local input_file="$1"
+
+  if [[ "$TOOL" == "amp" ]]; then
+    cat "$SCRIPT_DIR/prompt.md" > "$input_file"
+  elif [[ "$TOOL" == "claude" ]]; then
+    cat "$SCRIPT_DIR/CLAUDE.md" > "$input_file"
   else
     {
       echo "# Ralph Execution Context"
@@ -333,8 +434,124 @@ run_selected_tool() {
       echo "Progress file: $PROGRESS_FILE"
       echo ""
       cat "$SCRIPT_DIR/CODEX.md"
-    } | codex exec -C "$PROJECT_ROOT" -s danger-full-access 2>&1 | tee /dev/stderr
+    } > "$input_file"
   fi
+}
+
+run_selected_tool_with_watchdog() {
+  local output_file="$1"
+  local meta_file="$2"
+  local input_file command_json
+
+  input_file="$(mktemp "${TMPDIR:-/tmp}/ralph-input.XXXXXX")"
+  write_selected_tool_input "$input_file"
+  command_json="$(build_selected_tool_command_json)"
+
+  python3 - "$IDLE_TIMEOUT" "$output_file" "$meta_file" "$input_file" "$command_json" <<'PY'
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+idle_timeout = int(sys.argv[1])
+output_path = sys.argv[2]
+meta_path = sys.argv[3]
+input_path = sys.argv[4]
+command = json.loads(sys.argv[5])
+
+timed_out = False
+last_output_at = time.monotonic()
+exit_code = 0
+proc = None
+
+def forward_signal(signum, _frame):
+    global proc
+    if proc is not None and proc.poll() is None:
+        os.killpg(proc.pid, signum)
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGINT, forward_signal)
+signal.signal(signal.SIGTERM, forward_signal)
+
+with open(input_path, "rb") as stdin_handle, open(output_path, "wb") as output_handle:
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=stdin_handle,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        exit_code = 127
+        message = f"Failed to start {' '.join(command)}: {exc}\n".encode()
+        output_handle.write(message)
+        output_handle.flush()
+        sys.stdout.buffer.write(message)
+        sys.stdout.buffer.flush()
+        proc = None
+
+    if proc is not None:
+        stdout_fd = proc.stdout.fileno()
+
+        while True:
+            timeout = None
+            if idle_timeout > 0:
+                timeout = max(0, idle_timeout - (time.monotonic() - last_output_at))
+
+            ready, _, _ = select.select([stdout_fd], [], [], timeout)
+
+            if ready:
+                chunk = os.read(stdout_fd, 4096)
+                if chunk:
+                    last_output_at = time.monotonic()
+                    output_handle.write(chunk)
+                    output_handle.flush()
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                elif proc.poll() is not None:
+                    break
+            else:
+                if proc.poll() is None and idle_timeout > 0:
+                    timed_out = True
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                    break
+
+            if proc.poll() is not None and not ready:
+                break
+
+        while True:
+            chunk = os.read(stdout_fd, 4096)
+            if not chunk:
+                break
+            output_handle.write(chunk)
+            output_handle.flush()
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+
+        exit_code = proc.wait()
+
+with open(meta_path, "w", encoding="utf-8") as meta_handle:
+    json.dump(
+        {
+            "command": command,
+            "exitCode": exit_code,
+            "timedOut": timed_out,
+            "idleTimeoutSeconds": idle_timeout,
+        },
+        meta_handle,
+    )
+PY
+
+  rm -f "$input_file"
 }
 
 run_go() {
@@ -345,24 +562,29 @@ run_go() {
   ensure_progress_and_state_files
 
   local pending_before pending_after next_story_before next_story_after stagnant_count iterations_run reason output
+  local output_file meta_file child_exit_code child_timed_out
   stagnant_count="$(jq -r '.stagnantCount // 0' "$STATE_FILE" 2>/dev/null || echo "0")"
   iterations_run=0
 
   if [ "$(get_pending_story_count)" -eq 0 ]; then
-    write_state_file "complete" "" 0 "all_stories_passed" 0
+    set_current_run_context "" 0 "all_stories_passed" 0
     echo "Ralph already complete."
     echo "<promise>COMPLETE</promise>"
-    exit 0
+    finish_run "complete" 0
   fi
 
-  write_state_file "running" "$(get_next_story_field "id")" "$stagnant_count" "starting" 0
+  RUN_ACTIVE=true
+  set_current_run_context "$(get_next_story_field "id")" "$stagnant_count" "starting" 0
+  persist_current_run_state "running"
 
-  echo "Starting Ralph - Tool: $TOOL - Max iterations: $MAX_ITERATIONS - Stagnant limit: $STAGNANT_LIMIT"
+  echo "Starting Ralph - Tool: $TOOL - Max iterations: $MAX_ITERATIONS - Stagnant limit: $STAGNANT_LIMIT - Idle timeout: $IDLE_TIMEOUT"
 
   for i in $(seq 1 "$MAX_ITERATIONS"); do
     iterations_run="$i"
     pending_before="$(get_pending_story_count)"
     next_story_before="$(get_next_story_field "id")"
+    set_current_run_context "$next_story_before" "$stagnant_count" "running_iteration" "$iterations_run"
+    persist_current_run_state "running"
 
     echo ""
     echo "==============================================================="
@@ -370,37 +592,57 @@ run_go() {
     echo "==============================================================="
     echo "  Current story: ${next_story_before:-<none>}"
 
-    output="$(run_selected_tool || true)"
+    output_file="$(mktemp "${TMPDIR:-/tmp}/ralph-output.XXXXXX")"
+    meta_file="$(mktemp "${TMPDIR:-/tmp}/ralph-meta.XXXXXX")"
+    run_selected_tool_with_watchdog "$output_file" "$meta_file"
+    output="$(cat "$output_file")"
+    child_exit_code="$(jq -r '.exitCode // 0' "$meta_file" 2>/dev/null || echo "0")"
+    child_timed_out="$(jq -r '.timedOut // false' "$meta_file" 2>/dev/null || echo "false")"
+    rm -f "$output_file" "$meta_file"
 
     pending_after="$(get_pending_story_count)"
     next_story_after="$(get_next_story_field "id")"
 
     if echo "$output" | grep -q "<promise>COMPLETE</promise>"; then
-      write_state_file "complete" "" 0 "tool_reported_complete" "$iterations_run"
       echo ""
       echo "Ralph completed all tasks."
-      exit 0
+      set_current_run_context "" 0 "tool_reported_complete" "$iterations_run"
+      finish_run "complete" 0
     fi
 
     if echo "$output" | grep -q "<promise>REVIEW_REQUIRED</promise>"; then
-      write_state_file "review_required" "$next_story_after" "$stagnant_count" "tool_requested_review" "$iterations_run"
       echo ""
       echo "Ralph requires human review before continuing."
-      exit 3
+      set_current_run_context "$next_story_after" "$stagnant_count" "tool_requested_review" "$iterations_run"
+      finish_run "review_required" 3
     fi
 
     if echo "$output" | grep -q "<promise>BLOCKED</promise>"; then
-      write_state_file "blocked" "$next_story_after" "$stagnant_count" "tool_reported_blocked" "$iterations_run"
       echo ""
       echo "Ralph is blocked and stopped."
-      exit 2
+      set_current_run_context "$next_story_after" "$stagnant_count" "tool_reported_blocked" "$iterations_run"
+      finish_run "blocked" 2
     fi
 
     if [ "$pending_after" -eq 0 ]; then
-      write_state_file "complete" "" 0 "all_stories_passed" "$iterations_run"
       echo ""
       echo "Ralph completed all tasks."
-      exit 0
+      set_current_run_context "" 0 "all_stories_passed" "$iterations_run"
+      finish_run "complete" 0
+    fi
+
+    if [ "$child_timed_out" = "true" ]; then
+      echo ""
+      echo "Ralph stopped: $TOOL produced no output for $IDLE_TIMEOUT seconds."
+      set_current_run_context "$next_story_after" "$stagnant_count" "child_idle_timeout" "$iterations_run"
+      finish_run "review_required" 3
+    fi
+
+    if [ "${child_exit_code:-0}" != "0" ]; then
+      echo ""
+      echo "Ralph stopped: $TOOL exited unexpectedly with status $child_exit_code."
+      set_current_run_context "$next_story_after" "$stagnant_count" "child_aborted" "$iterations_run"
+      finish_run "review_required" 3
     fi
 
     if [ "$pending_after" -lt "$pending_before" ]; then
@@ -414,29 +656,31 @@ run_go() {
       reason="story_changed"
     fi
 
-    write_state_file "running" "$next_story_after" "$stagnant_count" "$reason" "$iterations_run"
+    set_current_run_context "$next_story_after" "$stagnant_count" "$reason" "$iterations_run"
+    persist_current_run_state "running"
 
     if [ "$stagnant_count" -ge "$STAGNANT_LIMIT" ]; then
-      write_state_file "blocked" "$next_story_after" "$stagnant_count" "stagnant_limit_reached" "$iterations_run"
       echo ""
       echo "Ralph blocked: story ${next_story_after:-<unknown>} made no progress for $stagnant_count iterations."
-      exit 2
+      set_current_run_context "$next_story_after" "$stagnant_count" "stagnant_limit_reached" "$iterations_run"
+      finish_run "blocked" 2
     fi
 
     echo "Iteration $i complete. Pending stories: $pending_after. Stagnant count: $stagnant_count."
     sleep 2
   done
 
-  write_state_file "max_iterations_reached" "$(get_next_story_field "id")" "$stagnant_count" "max_iterations_reached" "$MAX_ITERATIONS"
   echo ""
   echo "Ralph reached max iterations ($MAX_ITERATIONS) without completing all tasks."
   echo "Check $PROGRESS_FILE for status."
-  exit 4
+  set_current_run_context "$(get_next_story_field "id")" "$stagnant_count" "max_iterations_reached" "$MAX_ITERATIONS"
+  finish_run "max_iterations_reached" 4
 }
 
 TOOL="codex"
 MAX_ITERATIONS=10
 STAGNANT_LIMIT=3
+IDLE_TIMEOUT="${RALPH_IDLE_TIMEOUT:-600}"
 FORCE_INIT=false
 COMMAND="go"
 TARGET_DIR=""
@@ -505,6 +749,14 @@ case "$COMMAND" in
           ;;
         --stagnant-limit=*)
           STAGNANT_LIMIT="${1#*=}"
+          shift
+          ;;
+        --idle-timeout)
+          IDLE_TIMEOUT="$2"
+          shift 2
+          ;;
+        --idle-timeout=*)
+          IDLE_TIMEOUT="${1#*=}"
           shift
           ;;
         --help|-h|help)

@@ -18,6 +18,8 @@ The caller provides absolute paths for the project root, Ralph directory, PRD fi
 10. Update the PRD JSON to set `passes: true` for the completed story.
 11. Append your progress to the provided progress file path.
 
+Operate non-interactively. Do not stop to ask clarifying questions or wait for design feedback. Make reasonable assumptions from the repository state and either finish the story or emit a Ralph stop token.
+
 ## Progress Report Format
 
 Append to the progress file. Never replace it.

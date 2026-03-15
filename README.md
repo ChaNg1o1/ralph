@@ -40,12 +40,14 @@ This creates:
 
 - `ralph`
 - `scripts/ralph/ralph.sh`
+- `scripts/ralph/.gitignore`
 - `scripts/ralph/CODEX.md`
 - `scripts/ralph/prompt.md`
 - `scripts/ralph/CLAUDE.md`
 - `scripts/ralph/AGENTS.md`
 - `scripts/ralph/prd.json`
 - `scripts/ralph/progress.txt`
+- `scripts/ralph/.ralph-state.json`
 
 The generated `scripts/ralph/prd.json` is starter example data. Replace it with your real stories, or generate a fresh one from your PRD, before running `go`.
 
@@ -184,9 +186,12 @@ After `init`, review `scripts/ralph/prd.json` first. It is scaffolded from examp
 
 # Resume after a stop condition
 ./ralph resume
+
+# Fail cleanly if the nested tool goes silent for too long
+./ralph go --idle-timeout 600
 ```
 
-Default is 10 iterations. Use `--tool codex`, `--tool amp`, or `--tool claude` to select your AI coding tool.
+Default is 10 iterations. Use `--tool codex`, `--tool amp`, or `--tool claude` to select your AI coding tool. Use `--idle-timeout` to stop a hung child process after a silence window; pass `0` to disable that watchdog.
 
 Ralph will:
 1. Create a feature branch (from PRD `branchName`)
@@ -204,6 +209,8 @@ Ralph will:
 - `REVIEW_REQUIRED`: a human should check something, then continue with `./ralph resume`
 - `BLOCKED`: the same story is stuck or a prerequisite is missing
 - `MAX_ITERATIONS_REACHED`: it hit the configured iteration cap
+
+If the run is interrupted by `INT` or `TERM`, Ralph now records `interrupted` in `.ralph-state.json` instead of leaving the loop marked as `running`.
 
 ## Key Files
 
